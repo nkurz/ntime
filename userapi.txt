@@ -1,0 +1,175 @@
+C API:
+  Used by code that wants to set up or read counters
+  That code can either measure itself or other programs
+  Should not require running as root to read (and preferably not to set)
+  Back to back readings allowed for splits
+  Each counter should be able to be read independently and in any order
+  Safe to assume that libntime can be compiled C99? 
+
+
+Situations to be used and output written to:
+  Standalone, custom file.
+  Perfctr sets up counters, runs program, reads results after or during
+  Program sets up counters, spawn a group of threads, write to common file
+  Independent group of processes writing to common file
+  Independent processes writing to 0mq socket  
+  Running on multiple machines openmpi with Perfctr, stdout sent back
+  Openmpi running standalone programs that monitor themselves
+
+Output can be set from environment:
+  Allows parent process to set for children
+  char *output = getenv("NTIME_OUTPUT");
+  ntime->output_fd = open(output, O_APPEND);
+  Use fd instead of FILE * for atomic (noninterleaved) lockless writes?
+  NTIME_OUTPUT can encode protocol:
+    0mq://remote.server:4000
+
+Output function used is determined by NTIME_OUTPUT protocol
+  // Goals for ntime_output_t:  support writing files, sockets, 0mq, string,
+  //                             hash, shared mem
+  // Subclass can be chosen at runtime based on NTIME_OUTPUT
+  // public interface: write() must come first in all subclasses
+  typedef struct {
+      int (*write)(ntime_conf_t *conf, ntime_result_t *result);
+  } ntime_output_t;
+  // subclasses can have extra private data member(s)
+  struct private_output_s {
+      int (*write)(ntime_conf_t *conf, ntime_result_t *result);
+      int private_fd;
+  };
+  int private_output_write(ntime_conf_t *conf, ntime_result_t *result) {
+      // extract text from result and write
+  }
+
+// TSC is always read at each start and stop
+// want to know CPU unhalted in ns --- requires knowing ref freq. 
+// goal is to only read TSC once per start/stop and then use it for all related
+
+// counters are simple uint64_t[]
+typedef struct {
+    int numCounters;    
+    uint64_t *counters; // values for activeCounters
+    char *type;         // user defined type (region)
+    uint64_t id;        // user defined id   (numeric region)
+    uint64_t rawTSC;    // raw reading from TSC
+    uint64_t timestamp; // rawTSC - conf->startTimestamp
+    uint64_t walltime;  // rawTSC * conf->cpuNanosecondsPerTSC
+    // more local values can be added here
+} ntime_result_t;
+
+// Could skip numCounters and numActive, null terminate arrays instead?  Probably bug-prone.
+
+// users don't need to know if counter is MSR or PCI or other
+typedef struct {
+    char *eventName;      // Intel standard name for event (if possible)
+    char *counterName;    // external universal name of PMC
+    int fd;               // connection to device driver for this counter
+    int (*read)(...);     // set at runtime fd/RDPMC/RDMSR/*data
+    int (*write)(...);    
+    void *data;           // used by read() and write()
+} ntime_active_t;
+
+typedef struct {
+    char *eventString;  // from env NTIME_EVENTS
+    ntime_output_t *output;  // opaque except output->write(output, result)
+                              // output only used by ntime_result_write()
+    int numActive;      // number of active counters
+    ntime_active_t *active;   // array of active counters
+    uint64_t cpuNanosecondsPerTSC; // inverse TSC increments per second
+    uint64_t startTime; // rdtsc at initialization
+} ntime_conf_t;
+
+// ntime_result_new: allocate as all zeros
+// ntime_result_free: 
+// ntime_result_copy: malloc and memcpy
+// ntime_result_zero: zero using memset(0)
+// ntime_result_add:
+// ntime_result_subtract:
+
+// joins only the actual counters --- other tsc elements can be added by user
+// ntime_counters_join(result, ", "):  "active0, active1, ..."
+
+// ntime_string_new()
+// ntime_string_counts()
+// ntime_string_names()
+// ntime_string_append()
+// ntime_string_free()
+
+// all calls to ntime_* should evaluate to constant NULL/0 if ntime is not active at run time
+// this is in addition to being defined as blank if ntime is not activated at compile time
+# define ntime_result_whatever(result, conf)  result ? ntimeResultWhatever(result, conf) : NULL
+
+// internal functions are passed explicit 'conf' rather than using global
+ntime_string_t *ntimeCounterNames(ntime_conf_t *conf, char *join) {
+    // used to create header for output
+    bstring names = bfromcstr("");  // no automatic timestamp, just join
+    for (int i = 0; i < conf->numCounters - 1; i++) {
+        bcatcstr(names, conf->counters->counterName[i]);
+        bcatcstr(names, join);
+    }
+    bcatcstr(names, conf->counters->counterName[conf->numCounters]);
+    DEBUG_PRINT("'%s'", bdata(names));
+    return names;
+}
+
+
+Sample usages:
+
+  Self monitoring repeated calls to same function (intentionally overbuilt)
+    ntime_conf_t *conf = ntime_init(getenv("NTIME_COUNTERS"));  
+
+    ntime_string_t *output = ntime_join_names(conf, ", "); // join names to a bstring
+    conf->output->write(conf, result);  // can start writing any time
+
+    // calculate overhead of doing nothing to subtract from other readings
+    ntime_result_t *overhead = ntime_result_new(conf, "overhead", 0); 
+    ntime_result_start(overhead); 
+    ntime_result_stop(overhead);  
+
+    // start a counter that counts everything that happens
+    ntime_result_t *total = ntime_result_new(conf, "total", 0); 
+    ntime_start_result(total);
+
+    ntime_result_t *cumulative = ntime_result_new(conf, "cumulative", 0); 
+    ntime_result_t *result = ntime_result_new(conf, "result", 0); 
+
+    for (int i = 0; i < something; i++) {
+        ntime_result_start(result); 
+        do_the_function();
+        ntime_result_stop(result);  
+
+        ntime_counts_sub(result, overhead);
+        conf->output->write(conf, result);
+        result->id++;
+        ntime_counts_add(cumulative, result);
+     }
+
+     ntime_result_stop(total);
+     conf->output->write(conf, total);
+     
+     conf->output->write(conf, cumulative);
+
+     ntime_result_free(overhead);
+     ntime_result_free(cumulative);
+     ntime_result_free(total);
+     ntime_result_free(result);
+     
+     ntime_done()
+
+----
+
+As perfctr: 
+
+   ntime_init(command_line_counters);  
+
+   ntime_result_t child = ntime_result_new(conf, "child", 0);
+
+   ntime_result_start(child);
+
+   // exec whatever
+
+   ntime_result_stop(child);
+
+   // write the output
+
+   ntime_done()

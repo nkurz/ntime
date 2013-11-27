@@ -1,0 +1,154 @@
+Desirable:
+A consistent interface for both MSR and PCI performance monitors
+Can be made accessible from user space as a non-root user
+Very low overhead counter reads for function level profiling
+Full access to all processor performance counters and features
+Consistency with published Intel/AMD documentation
+
+Definitions:
+PMU: Performance Monitoring Unit
+Uncore: processor functions not tied to an individual core (L3 and RAM)
+MSR: Model Specific Register
+
+Types of counters:
+Per-core: Generally accessed by MSR
+Per-socket: Split between MSR and PCI
+
+MSR: Some are read only, some are write only, some both.
+Each has an address in "MSR IO space" (< 0x1000). 
+Address used directly, never mapped to another address space. 
+All can be read with assembly RDMSR, written with WRMSR.
+   But RDMSR/WRMSR can only be run from Ring 0 (kernel module).  
+   Root is irrelevant, distinction is made by processor not OS.
+Basic counters (3 Fixed, 8 Programmable) can also be read with RDPMC.
+   Can be executed from user space if CR4.PCE is set in advance.
+RDPMC is about 30 cycles, RDMSR about 100.  
+   RDPMC doesn't require syscall, which saves SYSCALL/SYSRET switch
+   RDPMC uses it's own address scheme:
+     Bit 30 for Fixed/General
+     Index number of counter (0-2 Fixed /0-7 General)
+
+PCI Configuration Space is the first 256 bytes.
+Extended Configuration Space (PCI-X 2) is 4096 bytes.
+  Legacy method of access via I/O space address 0xCF8/0xCFC.
+  https://github.com/torvalds/linux/blob/master/arch/x86/pci/direct.c
+Modern preference is for Memory Access only
+  PCI Address space is separate from MSR, user, and kernel.
+  Comparable to RAM Physical Address, although addresses are distinct.
+  Can be accessed directly by CPU just like RAM.
+PCI addresses are assigned to the card as BAR's. 
+  Device is told to respond to a particular address.
+  For the counters, we care about BAR0 (4K). 
+Already mapped into kernal memory at a high adddress.
+  Can be accessed by /dev/mem as root. Discouraged.
+Access is usually through /proc or /sys
+  Read access to first 256 Bytes for all
+  R/W and full 4K just by root
+Can be mapped into user space memory by a kernel device driver
+  Allows process to read and write PCI same as regular memory
+  Technically better to use assembly IN/OUT, but not required
+
+Other performance monitors (Thermal, Power) can only be read by MSR
+  Thus must be read by a kernel device driver.
+    fd = open(/dev/thermal0), counter = read(fd)
+
+Lowest overhead read access for non-root user:
+  PMC: RDPMC from user space, no setup needed
+  PCI: mmap() by kernel driver, then direct
+  other MSR: read from /dev kernel driver
+
+Root can mmap PCI space, but no way to pass this to non-root process
+  Should be able to open as root and pass fd over local socket
+  But proc_bus_pci_mmap() checks capable(CAP_SYS_RAWIO) at mmap() time
+    Should check file_ns_capable() instead?
+  Could use a local server running as root instead of device driver
+
+Linux 'perf' tools can do much of this
+  Designed for a common subset of all processors
+    Thus hard to take advantage of processor specific features
+  I find it very hard to get my head around, spread all around kernel
+  Internal politics seem horrible, attitudes lousy.
+    Avoid and aim for something simple and transparent.
+    Driver should do no thinking, just provide efficient access.
+
+Create a dev hierarchy that matches Intel documentation
+  Eventually AMD, whatever else
+  Hierachy matches current processor
+  Different kernel module for each processor
+  Individual addresses have handlers to allow filesystem permissions for r/w
+    Otherwise difficult to allow different root/non-root read and write options
+    Only 'safe' MSR's are accessible (unlike /dev/msr)
+  Devices go under /sys/devices/ntime
+
+Two directories for raw devices:
+  pci/D16:F4:F0
+  ntime/msr/0x0D04
+
+Symlink aliases for different naming schemes:
+  intel/MSR_PERF_FIXED_CTR_CTRL ->  ../msr/0x038D
+  local/FIXED0_CTRL -> ../msr/0x038D
+  perf/WHAT_PERF_CALLS_IT -> ../msr/0x038D
+
+Per core items need to be per core.   Per socket items are per socket.
+Difficult since Linux usage of 'cpu' is unclear between core and socket.
+Solve it by ignoring sockets, calling avoiding use of 'cpu'
+  And symlinks to appropriate uncore:
+    ntime/core0/msr/
+    ntime/core0/uncore -> ../uncore0
+    ntime/core5/msr/
+    ntime/core5/uncore -> ../uncore1
+    ntime/uncore0/msr/
+    ntime/uncore0/pci
+    ntime/uncore1/msr
+    ntime/uncore1/pci
+Aliases (intel/ etc) are at same level as msr/ and pci/ for both
+
+Normally syscalls (like read from device fd) happen on callers thread/core.
+  To handle request to read or write another core with read(fd).  
+    smp_call_function_single() should work
+User space RDPMC will be impossible --- should refuse to issue this type if cross core
+Counter init should pin thread to current core 
+
+Unified fast read for all counters/monitors:
+  ntime_get_reader(&counter)
+    counter->fd = open(ntime/device)
+    struct { int type; void *data } reader = mmap(fd)
+    counter->read = choose_reader(reader.type)
+    counter->data = reader.data
+    munmap(reader) // actual map (if any) is at data
+  counter.read(counter)
+  mmap() is used/abused to return something other than a normal map
+  Mapping only occurs for PCI type and is returned as .data
+  Need to use mmap() instead of ioctl so that mapping is possible for PCI
+    Type 0: default read from fd
+    Type 1: data is PCI, use *data
+    Type 2: data is PMC, use RDPMC(data)
+    Type 3: data is MSR, root can use RDMSR(data), others read fd
+    Type 4: data is TSC, use RDTSC (?)
+  Fast reader functionality will be wrapped in 'init' function for counter.
+  All reads return 64 bit results for consitency (converted internally)
+
+Writes are always write(fd) (although PCI write would work if map is r/w)
+  open() only allows one open writer (others fail or block) per device
+  1 writer + reader(s) OK, user is assumed to be doing the coordination.
+
+mmap() is allowed on all devices, even if it can't be mapped properly. 
+Primary security is file level permissions set by administrator.
+If permissions are correct, mmap() will:
+  1) Change fd interface to expect binary data
+  2) Map in PCI space if appropriate
+  3) Return info for the caller to choose the fastest read/write methods
+  4) Return value is also newly mapped, and can be unmapped immediately. 
+mmap() security isn't perfect, since whole page needs to be mapped.
+  Allows access to other registers on that PCI device
+  Should be safe enough for read only
+  Perhaps always map read only for security?
+
+
+
+
+
+
+
+
+    
