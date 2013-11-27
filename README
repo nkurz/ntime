@@ -2,3 +2,43 @@ ntime
 =====
 
 Non-existent low-level performance counter monitoring library
+
+I'm interested in creating a Linux library or kernel module that allows easy access to all of the performance counters supported by modern processors.  While designed to work across a number of processors, programs using it will not be 'portable' in the usual sense.  
+
+The approach for each processor will take advantage of all the monitors that processor has to offer, rather than reducing to a common set shared by all. 
+In particular, modern Intel processors offer a large number of 'uncore' performance monitors for memory access and other non-core-specific activities.  
+
+I'd like to end up with a simple and transparent system instead of one that does everything.  I'd like it to have a few layers between it and the processor as possible, so that the AMD/Intel Architecture Guides can be used as documentation.  
+
+
+Other similar tools that actually exist:
+
+Linux perf:  https://github.com/torvalds/linux/tree/master/tools/perf
+Difficult to use beyond a common subset of monitors.
+
+pmu-tools: https://github.com/andikleen/pmu-tools
+Intel specific extensions to the perf tools.  
+
+likwid: https://code.google.com/p/likwid/
+Aproach most similar to what I'm considering, best uncore support.
+
+PAPI: http://icl.cs.utk.edu/papi/
+Gigantic and complex.  I've never figured out where to start.
+
+perfmon2/libpfm4: http://perfmon2.sourceforge.net/
+Changed over time.  Now a helper front end to perf_events?
+
+perfctr: http://user.it.uu.se/~mikpe/linux/perfctr/current/
+Abandoned?
+
+LiMiT: http://castl.cs.columbia.edu/limit/
+Low overhead direct reads by Kernel patches
+
+Papers: 
+
+http://web.eece.maine.edu/~vweaver/projects/perf_events/overhead/fastpath2013_perfevents.pdf
+Great overview as of 2013 of what's out there and how it came to be.
+
+http://web3.cs.columbia.edu/~simha/preprint_isca11.pdf
+2011 Summary, and reasons for wanting low-overhead measurements for LiMiT.
+
